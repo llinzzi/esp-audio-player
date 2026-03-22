@@ -8,6 +8,8 @@
 * MP3 decoding (via libhelix-mp3)
 * Wav/wave file decoding
 * Audio mixing (multiple concurrent streams)
+* HTTP/HTTPS audio streaming (with buffering)
+* Abstract stream I/O interface (file, memory, HTTP, etc.)
 
 ## Who is this for?
 
@@ -82,6 +84,98 @@ audio_stream_handle_t bgm_stream = audio_stream_new(&stream_cfg);
 
 FILE *f = fopen("/sdcard/music.mp3", "rb");
 audio_stream_play(bgm_stream, f);
+```
+
+## HTTP Streaming
+
+Play audio directly from HTTP/HTTPS URLs with built-in buffering and auto-reconnection support.
+
+### Enabling HTTP Streaming
+
+In `idf.py menuconfig`:
+```
+Audio playback → Enable HTTP streaming support
+```
+
+### Basic HTTP Streaming Usage
+
+```c
+#include "audio_stream.h"
+#include "audio_http_stream.h"
+#include "audio_stream_io.h"
+
+// Initialize mixer first (see above)
+
+// Create a stream
+audio_stream_config_t stream_cfg = DEFAULT_AUDIO_STREAM_CONFIG("radio");
+audio_stream_handle_t stream = audio_stream_new(&stream_cfg);
+
+// Open HTTP stream
+audio_http_stream_config_t http_cfg = DEFAULT_AUDIO_HTTP_STREAM_CONFIG(
+    "http://example.com/audio.mp3"
+);
+audio_http_stream_handle_t http_stream = audio_http_stream_open(&http_cfg);
+
+// Get the stream I/O interface and play
+audio_stream_io_handle_t io;
+audio_http_stream_get_io(http_stream, &io);
+audio_stream_play_io(stream, io);
+
+// When done, remember to close the HTTP stream
+// audio_http_stream_close(http_stream);
+```
+
+### Memory/Buffer Playback
+
+Play audio from a memory buffer using the abstract stream I/O interface:
+
+```c
+const uint8_t *mp3_data = ...; // your MP3 data in memory
+size_t mp3_size = ...;          // size of the MP3 data
+
+audio_stream_io_handle_t io = audio_stream_io_from_memory(mp3_data, mp3_size, true);
+audio_stream_play_io(stream, io);
+```
+
+### HTTP Stream Configuration
+
+```c
+audio_http_stream_config_t http_cfg = {
+    .url = "http://example.com/audio.mp3",
+    .buffer_size = 64 * 1024,        // 64KB buffer
+    .low_watermark = 16 * 1024,       // Pause playback when < 16KB buffered
+    .high_watermark = 48 * 1024,      // Resume playback when > 48KB buffered
+    .reconnect_timeout_ms = 5000,      // Try to reconnect after 5 seconds
+    .read_timeout_ms = 10000,          // Read timeout 10 seconds
+    .enable_auto_reconnect = true      // Auto-reconnect on disconnect
+};
+```
+
+### HTTP Stream Events
+
+Register event callbacks to monitor connection status:
+
+```c
+static void http_event_handler(audio_http_stream_event_t event, void *user_ctx) {
+    switch (event) {
+        case AUDIO_HTTP_STREAM_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "Connected to server");
+            break;
+        case AUDIO_HTTP_STREAM_EVENT_BUFFERING:
+            ESP_LOGI(TAG, "Buffering...");
+            break;
+        case AUDIO_HTTP_STREAM_EVENT_BUFFER_READY:
+            ESP_LOGI(TAG, "Buffer ready, starting playback");
+            break;
+        case AUDIO_HTTP_STREAM_EVENT_ERROR:
+            ESP_LOGE(TAG, "Stream error");
+            break;
+        default:
+            break;
+    }
+}
+
+audio_http_stream_register_cb(http_stream, http_event_handler, NULL);
 ```
 
 ## States
