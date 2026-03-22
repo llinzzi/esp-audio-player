@@ -39,6 +39,7 @@
 
 #include "audio_wav.h"
 #include "audio_mp3.h"
+#include "audio_stream_io.h"
 
 static const char *TAG = "audio";
 
@@ -57,6 +58,7 @@ typedef struct {
 
     // valid if type == AUDIO_PLAYER_EVENT_TYPE_PLAY
     FILE* fp;
+    audio_stream_io_handle_t io;  // valid if fp is NULL
 } audio_player_event_t;
 
 typedef enum {
@@ -408,6 +410,154 @@ clean_up:
     return ret;
 }
 
+static esp_err_t aplay_io(audio_instance_t *i, audio_stream_io_handle_t io) {
+    LOGI_1("start to decode from stream io");
+
+    esp_err_t ret = ESP_OK;
+    audio_player_event_t audio_event = { .type = AUDIO_PLAYER_REQUEST_NONE, .fp = NULL, .io = NULL };
+
+    FILE_TYPE file_type = FILE_TYPE_UNKNOWN;
+
+#if defined(CONFIG_AUDIO_PLAYER_ENABLE_MP3)
+    if(is_mp3_io(io)) {
+        file_type = FILE_TYPE_MP3;
+        LOGI_1("file is mp3");
+
+        // initialize mp3_instance
+        i->mp3_data.bytes_in_data_buf = 0;
+        i->mp3_data.read_ptr = i->mp3_data.data_buf;
+        i->mp3_data.eof_reached = false;
+    }
+#endif
+
+#if defined(CONFIG_AUDIO_PLAYER_ENABLE_WAV)
+    if(file_type == FILE_TYPE_UNKNOWN)
+    {
+        if(is_wav_io(io, &i->wav_data)) {
+            file_type = FILE_TYPE_WAV;
+            LOGI_1("file is wav");
+        }
+    }
+#endif
+
+    if(file_type == FILE_TYPE_UNKNOWN) {
+        ESP_LOGE(TAG, "unknown file type, cleaning up");
+        dispatch_callback(i, AUDIO_PLAYER_CALLBACK_EVENT_UNKNOWN_FILE_TYPE);
+        goto clean_up;
+    }
+
+    do {
+        /* Process audio event sent from other task */
+        if (pdPASS == xQueuePeek(i->event_queue, &audio_event, 0)) {
+            LOGI_2("event in queue");
+            if (AUDIO_PLAYER_REQUEST_PAUSE == audio_event.type) {
+                xQueueReceive(i->event_queue, &audio_event, 0);
+
+                set_state(i, AUDIO_PLAYER_STATE_PAUSE);
+
+                while(1) {
+                    xQueuePeek(i->event_queue, &audio_event, portMAX_DELAY);
+
+                    if((AUDIO_PLAYER_REQUEST_PLAY != audio_event.type) &&
+                       (AUDIO_PLAYER_REQUEST_STOP != audio_event.type) &&
+                       (AUDIO_PLAYER_REQUEST_RESUME != audio_event.type))
+                    {
+                        xQueueReceive(i->event_queue, &audio_event, 0);
+                    } else {
+                        break;
+                    }
+                }
+
+                if(AUDIO_PLAYER_REQUEST_RESUME == audio_event.type) {
+                    xQueueReceive(i->event_queue, &audio_event, 0);
+                    continue;
+                }
+            }
+
+            if ((AUDIO_PLAYER_REQUEST_STOP == audio_event.type) ||
+                (AUDIO_PLAYER_REQUEST_PLAY == audio_event.type)) {
+                ret = ESP_OK;
+                goto clean_up;
+            } else {
+                xQueueReceive(i->event_queue, &audio_event, 0);
+                continue;
+            }
+        }
+
+        set_state(i, AUDIO_PLAYER_STATE_PLAYING);
+
+        DECODE_STATUS decode_status = DECODE_STATUS_ERROR;
+
+        switch(file_type) {
+#if defined(CONFIG_AUDIO_PLAYER_ENABLE_MP3)
+            case FILE_TYPE_MP3:
+                decode_status = decode_mp3_io(i->mp3_decoder, io, &i->output, &i->mp3_data);
+                break;
+#endif
+#if defined(CONFIG_AUDIO_PLAYER_ENABLE_WAV)
+            case FILE_TYPE_WAV:
+                decode_status = decode_wav_io(io, &i->output, &i->wav_data);
+                break;
+#endif
+            case FILE_TYPE_UNKNOWN:
+                ESP_LOGE(TAG, "unexpected unknown file type when decoding");
+                break;
+        }
+
+        if(decode_status == DECODE_STATUS_CONTINUE)
+        {
+            if(i->output.fmt.channels == 1 && i->config.force_stereo) {
+                LOGI_3("c == 1, mono -> stereo");
+                ret = mono_to_stereo(i->output.fmt.bits_per_sample, i->output);
+                if(ret != ESP_OK) {
+                    goto clean_up;
+                }
+            }
+
+            if ((i->i2s_format.sample_rate != i->output.fmt.sample_rate) ||
+                    (i->i2s_format.channels != i->output.fmt.channels) ||
+                    (i->i2s_format.bits_per_sample != i->output.fmt.bits_per_sample)) {
+                i->i2s_format = i->output.fmt;
+                LOGI_1("format change: sr=%d, bit=%lu, ch=%lu",
+                        i->i2s_format.sample_rate,
+                        i->i2s_format.bits_per_sample,
+                        i->i2s_format.channels);
+                i2s_slot_mode_t channel_setting = (i->i2s_format.channels == 1) ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO;
+                ret = i->config.clk_set_fn(i->i2s_format.sample_rate,
+                            i->i2s_format.bits_per_sample,
+                            channel_setting);
+                ESP_GOTO_ON_ERROR(ret, clean_up, TAG, "i2s_set_clk");
+            }
+
+            size_t bytes_written = 0;
+            size_t bytes_to_write = i->output.frame_count * i->output.fmt.channels * (i->i2s_format.bits_per_sample / 8);
+            LOGI_2("c %d, bps %d, bytes %d, frame_count %d",
+                i->output.fmt.channels,
+                i->i2s_format.bits_per_sample,
+                bytes_to_write,
+                i->output.frame_count);
+
+            if (i->config.write_ctx)
+                i->config.write_fn2(i->output.samples, bytes_to_write, &bytes_written, portMAX_DELAY, i->config.write_ctx);
+            else
+                i->config.write_fn(i->output.samples, bytes_to_write, &bytes_written, portMAX_DELAY);
+
+            if(bytes_to_write != bytes_written) {
+                ESP_LOGE(TAG, "to write %d != written %d", bytes_to_write, bytes_written);
+            }
+        } else if(decode_status == DECODE_STATUS_NO_DATA_CONTINUE)
+        {
+            LOGI_2("no data");
+        } else {
+            LOGI_1("breaking out of playback");
+            break;
+        }
+    } while (true);
+
+clean_up:
+    return ret;
+}
+
 static void audio_task(void *pvParam) {
     audio_instance_t *i = static_cast<audio_instance_t*>(pvParam);
     audio_player_event_t audio_event;
@@ -454,14 +604,22 @@ static void audio_task(void *pvParam) {
         }
 
         if (i->config.mute_fn) i->config.mute_fn(AUDIO_PLAYER_UNMUTE);
-        esp_err_t ret_val = aplay_file(i, audio_event.fp);
+        esp_err_t ret_val;
+
+        if (audio_event.io) {
+            ret_val = aplay_io(i, audio_event.io);
+        } else {
+            ret_val = aplay_file(i, audio_event.fp);
+        }
+
         if(ret_val != ESP_OK)
         {
-            ESP_LOGE(TAG, "aplay_file() %d", ret_val);
+            ESP_LOGE(TAG, "playback failed %d", ret_val);
         }
         if (i->config.mute_fn) i->config.mute_fn(AUDIO_PLAYER_MUTE);
 
         if(audio_event.fp) fclose(audio_event.fp);
+        if(audio_event.io) audio_stream_io_close(audio_event.io);
     }
 }
 
@@ -634,6 +792,15 @@ esp_err_t audio_instance_delete(audio_instance_handle_t h) {
     }
 
     return ESP_OK;
+}
+
+esp_err_t audio_instance_play_io(audio_instance_handle_t h, audio_stream_io_handle_t io) {
+    audio_instance_t *i = static_cast<audio_instance_t *>(h);
+    CHECK_INSTANCE(i);
+
+    LOGI_1("%s", __FUNCTION__);
+    audio_player_event_t event = { .type = AUDIO_PLAYER_REQUEST_PLAY, .fp = NULL, .io = io };
+    return audio_send_event(i, event);
 }
 
 /* ================= Legacy API implemented via default instance ================= */

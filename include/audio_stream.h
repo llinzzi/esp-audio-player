@@ -6,6 +6,8 @@
 #pragma once
 
 #include "audio_player.h"
+#include "audio_stream_io.h"
+#include "audio_http_stream.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -83,6 +85,50 @@ audio_stream_type_t audio_stream_get_type(audio_stream_handle_t h);
  *    - Others: Fail
  */
 esp_err_t audio_stream_play(audio_stream_handle_t h, FILE *fp);
+
+/**
+ * @brief Play audio from a stream I/O interface
+ *
+ * Only supported for DECODER type streams.
+ *
+ * @param h Handle of the stream
+ * @param io Stream I/O handle
+ * @return
+ *    - ESP_OK: Success
+ *    - ESP_ERR_NOT_SUPPORTED: Stream is not a decoder stream
+ *    - Others: Fail
+ */
+esp_err_t audio_stream_play_io(audio_stream_handle_t h, audio_stream_io_handle_t io);
+
+/**
+ * @brief Play audio from an HTTP URL
+ *
+ * Only supported for DECODER type streams.
+ *
+ * @param h Handle of the stream
+ * @param url HTTP/HTTPS URL to stream from
+ * @return
+ *    - ESP_OK: Success
+ *    - ESP_ERR_NOT_SUPPORTED: Stream is not a decoder stream
+ *    - Others: Fail
+ */
+esp_err_t audio_stream_play_url(audio_stream_handle_t h, const char *url);
+
+/**
+ * @brief Play audio from an HTTP URL with custom configuration
+ *
+ * Only supported for DECODER type streams.
+ *
+ * @param h Handle of the stream
+ * @param url HTTP/HTTPS URL to stream from
+ * @param cfg HTTP stream configuration (can be NULL for defaults)
+ * @return
+ *    - ESP_OK: Success
+ *    - ESP_ERR_NOT_SUPPORTED: Stream is not a decoder stream
+ *    - Others: Fail
+ */
+esp_err_t audio_stream_play_url_with_config(audio_stream_handle_t h, const char *url,
+                                              const audio_http_stream_config_t *cfg);
 
 /**
  * @brief Queue an audio file to be played on a stream

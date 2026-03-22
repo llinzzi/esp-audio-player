@@ -1,7 +1,8 @@
 #pragma once
 
 #include "esp_err.h"
-#include "include/audio_player.h"
+#include "audio_player.h"
+#include "audio_stream_io.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,6 +24,7 @@ audio_player_state_t audio_instance_get_state(audio_instance_handle_t h);
 esp_err_t audio_instance_callback_register(audio_instance_handle_t h, audio_player_cb_t call_back, void *user_ctx);
 
 esp_err_t audio_instance_play(audio_instance_handle_t h, FILE *fp);
+esp_err_t audio_instance_play_io(audio_instance_handle_t h, audio_stream_io_handle_t io);
 esp_err_t audio_instance_pause(audio_instance_handle_t h);
 esp_err_t audio_instance_resume(audio_instance_handle_t h);
 esp_err_t audio_instance_stop(audio_instance_handle_t h);
