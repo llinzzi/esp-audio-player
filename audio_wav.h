@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include "audio_log.h"
 #include "audio_decode_types.h"
+#include "audio_stream_io.h"
 
 typedef struct {
     // The "RIFF" chunk descriptor
@@ -31,4 +32,6 @@ typedef struct {
 } wav_instance;
 
 bool is_wav(FILE *fp, wav_instance *pInstance);
+bool is_wav_io(audio_stream_io_handle_t io, wav_instance *pInstance);
 DECODE_STATUS decode_wav(FILE *fp, decode_data *pData, wav_instance *pInstance);
+DECODE_STATUS decode_wav_io(audio_stream_io_handle_t io, decode_data *pData, wav_instance *pInstance);
