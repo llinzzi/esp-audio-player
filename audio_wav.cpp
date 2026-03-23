@@ -87,7 +87,10 @@ DECODE_STATUS decode_wav(FILE *fp, decode_data *pData, wav_instance *pInstance) 
  * @return true if stream is a wav file
  */
 bool is_wav_io(audio_stream_io_handle_t io, wav_instance *pInstance) {
-    audio_stream_io_seek(io, 0, AUDIO_STREAM_SEEK_SET);
+    if (audio_stream_io_seek(io, 0, AUDIO_STREAM_SEEK_SET) != ESP_OK) {
+        ESP_LOGW(TAG, "is_wav_io: seek not supported");
+        return false;
+    }
 
     size_t bytes_read = audio_stream_io_read(io, &pInstance->header, sizeof(wav_header_t));
     if(bytes_read != sizeof(wav_header_t)) {
@@ -115,7 +118,9 @@ bool is_wav_io(audio_stream_io_handle_t io, wav_instance *pInstance) {
             break;
         } else {
             // advance beyond this subchunk, it could be a 'LIST' chunk with file info or some other unhandled subchunk
-            audio_stream_io_seek(io, subchunk.SubchunkSize, AUDIO_STREAM_SEEK_CUR);
+            if (audio_stream_io_seek(io, subchunk.SubchunkSize, AUDIO_STREAM_SEEK_CUR) != ESP_OK) {
+                return false;
+            }
         }
     }
 
