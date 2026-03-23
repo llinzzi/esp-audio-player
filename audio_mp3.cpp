@@ -172,7 +172,11 @@ DECODE_STATUS decode_mp3(HMP3Decoder mp3_decoder, FILE *fp, decode_data *pData, 
 bool is_mp3_io(audio_stream_io_handle_t io) {
     bool is_mp3_file = false;
 
-    audio_stream_io_seek(io, 0, AUDIO_STREAM_SEEK_SET);
+    // Reset to beginning first
+    if (audio_stream_io_seek(io, 0, AUDIO_STREAM_SEEK_SET) != ESP_OK) {
+        ESP_LOGW(TAG, "is_mp3_io: seek not supported, assuming not mp3");
+        return false;
+    }
 
     // see https://en.wikipedia.org/wiki/List_of_file_signatures
     uint8_t magic[3];
