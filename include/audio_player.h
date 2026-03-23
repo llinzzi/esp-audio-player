@@ -52,6 +52,7 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "driver/i2s_std.h"
+#include "audio_stream_io.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,6 +104,20 @@ typedef void (*audio_player_cb_t)(audio_player_cb_ctx_t *);
  *    - Others: Fail
  */
 esp_err_t audio_player_play(FILE *fp);
+
+/**
+ * @brief Play audio from a stream I/O interface.
+ *
+ * Will interrupt a present playback and start the new playback
+ * as soon as possible.
+ *
+ * @param io - Stream I/O handle. Will be closed by the audio system
+ *             when the playback has completed or in the event of a playback error.
+ * @return
+ *    - ESP_OK: Success in queuing play request
+ *    - Others: Fail
+ */
+esp_err_t audio_player_play_io(audio_stream_io_handle_t io);
 
 /**
  * @brief Pause playback
