@@ -10,6 +10,7 @@ set(includes
 )
 
 set(requires)
+set(priv_requires)
 
 if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.3")
     list(APPEND requires esp_driver_i2s esp_ringbuf)
@@ -30,10 +31,11 @@ endif()
 
 if(CONFIG_AUDIO_PLAYER_ENABLE_HTTP_STREAM)
     list(APPEND srcs "audio_http_stream.cpp")
-    list(APPEND requires "esp_http_client")
+    list(APPEND requires esp_http_client)
 endif()
 
 idf_component_register(SRCS "${srcs}"
                        INCLUDE_DIRS "${includes}"
                        REQUIRES "${requires}"
+                       PRIV_REQUIRES "${priv_requires}"
 )

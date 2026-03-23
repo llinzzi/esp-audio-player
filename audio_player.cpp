@@ -817,6 +817,10 @@ esp_err_t audio_player_play(FILE *fp) {
     return audio_instance_play(g_instance, fp);
 }
 
+esp_err_t audio_player_play_io(audio_stream_io_handle_t io) {
+    return audio_instance_play_io(g_instance, io);
+}
+
 esp_err_t audio_player_pause() {
     return audio_instance_pause(g_instance);
 }
