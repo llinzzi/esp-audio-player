@@ -577,10 +577,6 @@ esp_err_t audio_http_stream_close(audio_http_stream_handle_t h) {
         h->cfg.url = NULL;
     }
 
-    if (h->initial_buf) {
-        free(h->initial_buf);
-    }
-
     free(h);
     return ESP_OK;
 }
