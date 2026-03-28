@@ -57,7 +57,7 @@ static size_t http_stream_read(void *ctx, void *buf, size_t size) {
     size_t total_read = 0;
     uint8_t *dst = static_cast<uint8_t*>(buf);
 
-    // Note: ID3v2 tag skipping disabled - files with ID3 tags may not play correctly
+// Note: ID3v2 tag skipping disabled - files with ID3 tags may not play correctly
 
     // First, read from initial buffer if there's any data (for seek support)
     while (total_read < size && stream->initial_buf_read_pos < stream->initial_buf_filled) {
@@ -72,7 +72,7 @@ static size_t http_stream_read(void *ctx, void *buf, size_t size) {
     }
 
     // If initial buffer is exhausted or not used, read from ring buffer
-    // Retry a few times if ringbuffer is temporarily empty to avoid premature EOF
+// Retry a few times if ringbuffer is temporarily empty to avoid premature EOF
     int retry_count = 0;
     const int max_retries = 10;
 
@@ -104,6 +104,12 @@ static size_t http_stream_read(void *ctx, void *buf, size_t size) {
                     stream->initial_buf_filled += to_save;
                 }
             }
+        } else if (item) {
+            vRingbufferReturnItem(stream->ringbuf, item);
+        } else {
+            if (stream->eof_reached) {
+                break;
+            }
             retry_count = 0;  // Reset retry count on successful read
         } else {
             if (item) {
@@ -126,8 +132,22 @@ static size_t http_stream_read(void *ctx, void *buf, size_t size) {
 }
 
 static int http_stream_seek(void *ctx, long offset, int whence) {
-    // Seek not supported for HTTP stream
-    // Just return error to indicate seek is not possible
+    audio_http_stream_t *stream = static_cast<audio_http_stream_t*>(ctx);
+    if (!stream) return -1;
+
+    if (whence == AUDIO_STREAM_SEEK_SET && offset == 0) {
+        // Seek to beginning - only possible if we have the initial buffer
+        if (stream->initial_buf_filled > 0) {
+            stream->initial_buf_read_pos = 0;
+            ESP_LOGI(TAG, "seek to beginning using initial buffer (%d bytes)", stream->initial_buf_filled);
+            return 0;
+        } else {
+            ESP_LOGW(TAG, "seek to beginning but initial buffer is empty");
+            return -1;
+        }
+    }
+
+    ESP_LOGW(TAG, "seek not supported for offset=%ld whence=%d", offset, whence);
     return -1;
 }
 
@@ -555,6 +575,10 @@ esp_err_t audio_http_stream_close(audio_http_stream_handle_t h) {
     if (h->cfg.url) {
         free((void*)h->cfg.url);
         h->cfg.url = NULL;
+    }
+
+    if (h->initial_buf) {
+        free(h->initial_buf);
     }
 
     free(h);
