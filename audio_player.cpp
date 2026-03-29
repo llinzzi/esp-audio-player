@@ -390,9 +390,9 @@ static esp_err_t aplay_file(audio_instance_t *i, FILE *fp) {
 
             // NOTE: to aid transition in api, using write_fn2 based on write_ctx assignment
             if (i->config.write_ctx)
-                i->config.write_fn2(i->output.samples, bytes_to_write, &bytes_written, portMAX_DELAY, i->config.write_ctx);
+                i->config.write_fn2(i->output.samples, bytes_to_write, &bytes_written, pdMS_TO_TICKS(100), i->config.write_ctx);
             else
-                i->config.write_fn(i->output.samples, bytes_to_write, &bytes_written, portMAX_DELAY);
+                i->config.write_fn(i->output.samples, bytes_to_write, &bytes_written, pdMS_TO_TICKS(100));
 
             if(bytes_to_write != bytes_written) {
                 ESP_LOGE(TAG, "to write %d != written %d", bytes_to_write, bytes_written);
@@ -538,9 +538,9 @@ static esp_err_t aplay_io(audio_instance_t *i, audio_stream_io_handle_t io) {
                 i->output.frame_count);
 
             if (i->config.write_ctx)
-                i->config.write_fn2(i->output.samples, bytes_to_write, &bytes_written, portMAX_DELAY, i->config.write_ctx);
+                i->config.write_fn2(i->output.samples, bytes_to_write, &bytes_written, pdMS_TO_TICKS(100), i->config.write_ctx);
             else
-                i->config.write_fn(i->output.samples, bytes_to_write, &bytes_written, portMAX_DELAY);
+                i->config.write_fn(i->output.samples, bytes_to_write, &bytes_written, pdMS_TO_TICKS(100));
 
             if(bytes_to_write != bytes_written) {
                 ESP_LOGE(TAG, "to write %d != written %d", bytes_to_write, bytes_written);
