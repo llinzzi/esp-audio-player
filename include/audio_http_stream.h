@@ -148,6 +148,14 @@ size_t audio_http_stream_get_buffered_bytes(audio_http_stream_handle_t h);
 size_t audio_http_stream_get_total_bytes(audio_http_stream_handle_t h);
 
 /**
+ * @brief Get the content length from HTTP headers
+ *
+ * @param h HTTP stream handle
+ * @return Content length in bytes, or -1 if unknown
+ */
+int audio_http_stream_get_content_length(audio_http_stream_handle_t h);
+
+/**
  * @brief Pause the HTTP stream download
  *
  * Playback will continue until buffer is empty.

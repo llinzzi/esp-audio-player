@@ -38,6 +38,7 @@ typedef struct audio_http_stream {
 
     size_t total_bytes_downloaded;
     size_t bytes_available;
+    int content_length;  // Total content length from HTTP headers, -1 if unknown
 
     audio_stream_io_handle_t io_handle;
 
@@ -261,6 +262,7 @@ static void http_download_task(void *arg) {
             dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_CONNECTED);
 
             int content_length = esp_http_client_fetch_headers(client);
+            stream->content_length = content_length;
             ESP_LOGI(TAG, "Content length: %d", content_length);
         }
 
@@ -496,6 +498,11 @@ size_t audio_http_stream_get_buffered_bytes(audio_http_stream_handle_t h) {
 size_t audio_http_stream_get_total_bytes(audio_http_stream_handle_t h) {
     if (!h) return 0;
     return h->total_bytes_downloaded;
+}
+
+int audio_http_stream_get_content_length(audio_http_stream_handle_t h) {
+    if (!h) return -1;
+    return h->content_length;
 }
 
 esp_err_t audio_http_stream_pause(audio_http_stream_handle_t h) {
