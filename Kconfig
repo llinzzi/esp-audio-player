@@ -13,7 +13,7 @@ menu "Audio playback"
 
     config AUDIO_PLAYER_ENABLE_HTTP_STREAM
         bool "Enable HTTP streaming support"
-        default n
+        default y
         depends on AUDIO_PLAYER_ENABLE_MP3 || AUDIO_PLAYER_ENABLE_WAV
         help
             Enable support for streaming audio from HTTP/HTTPS URLs.

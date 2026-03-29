@@ -172,11 +172,7 @@ DECODE_STATUS decode_mp3(HMP3Decoder mp3_decoder, FILE *fp, decode_data *pData, 
 bool is_mp3_io(audio_stream_io_handle_t io) {
     bool is_mp3_file = false;
 
-    // Reset to beginning first
-    if (audio_stream_io_seek(io, 0, AUDIO_STREAM_SEEK_SET) != ESP_OK) {
-        ESP_LOGW(TAG, "is_mp3_io: seek not supported, assuming not mp3");
-        return false;
-    }
+    audio_stream_io_seek(io, 0, AUDIO_STREAM_SEEK_SET);
 
     // see https://en.wikipedia.org/wiki/List_of_file_signatures
     uint8_t magic[3];
@@ -262,6 +258,18 @@ DECODE_STATUS decode_mp3_io(HMP3Decoder mp3_decoder, audio_stream_io_handle_t io
     LOGI_2("unread %d, total %d, offset 0x%x(%d)",
             (int)unread_bytes, (int)pInstance->bytes_in_data_buf, offset, offset);
 
+    // Debug: log what data we're trying to decode
+    if (offset >= 0 && offset < unread_bytes && unread_bytes >= 4) {
+        uint8_t *sync_ptr = pInstance->read_ptr + offset;
+        ESP_LOGW(TAG, "MP3 sync found at offset %d: %02X %02X %02X %02X, unread=%d",
+                 offset, sync_ptr[0], sync_ptr[1], sync_ptr[2], sync_ptr[3], (int)unread_bytes);
+    } else if (offset < 0) {
+        ESP_LOGW(TAG, "MP3 sync NOT found in %d bytes, first bytes: %02X %02X %02X %02X",
+                 (int)unread_bytes,
+                 pInstance->read_ptr[0], pInstance->read_ptr[1],
+                 pInstance->read_ptr[2], pInstance->read_ptr[3]);
+    }
+
     if (offset >= 0) {
         COMPILE_3(int starting_unread_bytes = unread_bytes);
         uint8_t *read_ptr = pInstance->read_ptr + offset; /*!< Data start point */
@@ -281,6 +289,8 @@ DECODE_STATUS decode_mp3_io(HMP3Decoder mp3_decoder, audio_stream_io_handle_t io
 
             pData->frame_count = (frame_info.outputSamps / frame_info.nChans);
 
+            ESP_LOGI(TAG, "MP3 decode OK: ch=%d, sr=%d, frames=%d",
+                pData->fmt.channels, pData->fmt.sample_rate, pData->frame_count);
             LOGI_3("mp3: channels %d, sr %d, bps %d, frame_count %d, processed %d",
                 pData->fmt.channels,
                 pData->fmt.sample_rate,
@@ -296,8 +306,15 @@ DECODE_STATUS decode_mp3_io(HMP3Decoder mp3_decoder, audio_stream_io_handle_t io
                 LOGI_1("underflow read ptr is 0x%p", read_ptr);
                 return DECODE_STATUS_NO_DATA_CONTINUE;
             } else {
-                ESP_LOGE(TAG, "status error %d", mp3_dec_err);
-                return DECODE_STATUS_NO_DATA_CONTINUE;
+                // Invalid frame header - skip ahead to find next sync word
+                // Don't stay at the same position forever
+                ESP_LOGW(TAG, "invalid frame header %d, skipping 1 byte to find next sync", mp3_dec_err);
+                pInstance->read_ptr += 1;  // Skip 1 byte and try again
+                unread_bytes -= 1;
+                if (unread_bytes <= 0) {
+                    return DECODE_STATUS_NO_DATA_CONTINUE;
+                }
+                return DECODE_STATUS_CONTINUE;  // Try to find next sync
             }
         }
     } else {
