@@ -14,6 +14,7 @@
 #include "esp_check.h"
 
 #include "audio_http_stream.h"
+#include "audio_log.h"
 
 #if CONFIG_AUDIO_PLAYER_ENABLE_HTTP_STREAM
 #include "esp_http_client.h"
@@ -295,7 +296,7 @@ static void http_download_task(void *arg) {
             vRingbufferGetInfo(stream->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
             stream->bytes_available = items_waiting;
 
-            ESP_LOGI(TAG, "HTTP download: read=%d, total=%d, buffered=%d",
+            LOGI_2(TAG, "HTTP download: read=%d, total=%d, buffered=%d",
                     read_len, (int)stream->total_bytes_downloaded, (int)stream->bytes_available);
 
             if (stream->state == AUDIO_HTTP_STREAM_STATE_BUFFERING &&
