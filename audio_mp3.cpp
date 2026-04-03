@@ -261,10 +261,10 @@ DECODE_STATUS decode_mp3_io(HMP3Decoder mp3_decoder, audio_stream_io_handle_t io
     // Debug: log what data we're trying to decode
     if (offset >= 0 && offset < unread_bytes && unread_bytes >= 4) {
         uint8_t *sync_ptr = pInstance->read_ptr + offset;
-        ESP_LOGW(TAG, "MP3 sync found at offset %d: %02X %02X %02X %02X, unread=%d",
+        LOGI_2(TAG, "MP3 sync found at offset %d: %02X %02X %02X %02X, unread=%d",
                  offset, sync_ptr[0], sync_ptr[1], sync_ptr[2], sync_ptr[3], (int)unread_bytes);
     } else if (offset < 0) {
-        ESP_LOGW(TAG, "MP3 sync NOT found in %d bytes, first bytes: %02X %02X %02X %02X",
+        LOGI_2(TAG, "MP3 sync NOT found in %d bytes, first bytes: %02X %02X %02X %02X",
                  (int)unread_bytes,
                  pInstance->read_ptr[0], pInstance->read_ptr[1],
                  pInstance->read_ptr[2], pInstance->read_ptr[3]);
@@ -289,7 +289,7 @@ DECODE_STATUS decode_mp3_io(HMP3Decoder mp3_decoder, audio_stream_io_handle_t io
 
             pData->frame_count = (frame_info.outputSamps / frame_info.nChans);
 
-            ESP_LOGI(TAG, "MP3 decode OK: ch=%d, sr=%d, frames=%d",
+            LOGI_2(TAG, "MP3 decode OK: ch=%d, sr=%d, frames=%d",
                 pData->fmt.channels, pData->fmt.sample_rate, pData->frame_count);
             LOGI_3("mp3: channels %d, sr %d, bps %d, frame_count %d, processed %d",
                 pData->fmt.channels,
