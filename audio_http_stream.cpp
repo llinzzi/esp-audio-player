@@ -168,7 +168,38 @@ static void dispatch_event(audio_http_stream_t *stream, audio_http_stream_event_
 
 #if CONFIG_AUDIO_PLAYER_ENABLE_HTTP_STREAM
 
+/* Write a chunk of received body into the ring buffer, applying back-pressure
+ * (block-with-timeout) when the consumer is slow. Updates counters and triggers
+ * the BUFFERING -> PLAYING transition once the high watermark is reached. */
+static void http_feed_ringbuf(audio_http_stream_t *stream, const uint8_t *src, size_t len) {
+    if (!stream || !stream->ringbuf || !src || len == 0) return;
+
+    size_t remaining = len;
+    while (remaining > 0 && stream->task_running) {
+        // RINGBUF_TYPE_BYTEBUF send is all-or-nothing for the requested size.
+        BaseType_t res = xRingbufferSend(stream->ringbuf, src, remaining, pdMS_TO_TICKS(100));
+        if (res == pdTRUE) {
+            stream->total_bytes_downloaded += remaining;
+            remaining = 0;
+        } else {
+            // Ring buffer full: consumer is behind, wait and retry (TCP back-pressure).
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    UBaseType_t items_waiting = 0;
+    vRingbufferGetInfo(stream->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
+    stream->bytes_available = items_waiting;
+
+    if (stream->state == AUDIO_HTTP_STREAM_STATE_BUFFERING &&
+        stream->bytes_available >= stream->cfg.high_watermark) {
+        stream->state = AUDIO_HTTP_STREAM_STATE_PLAYING;
+        dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_BUFFER_READY);
+    }
+}
+
 static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
+    audio_http_stream_t *stream = static_cast<audio_http_stream_t*>(evt->user_data);
     switch (evt->event_id) {
         case HTTP_EVENT_ERROR:
             ESP_LOGE(TAG, "HTTP_EVENT_ERROR");
@@ -183,7 +214,8 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
             ESP_LOGI(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
             break;
         case HTTP_EVENT_ON_DATA:
-            ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            // Continuous-stream body: feed straight into the ring buffer.
+            http_feed_ringbuf(stream, static_cast<const uint8_t*>(evt->data), evt->data_len);
             break;
         case HTTP_EVENT_ON_FINISH:
             ESP_LOGI(TAG, "HTTP_EVENT_ON_FINISH");
@@ -200,144 +232,71 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
 
 static void http_download_task(void *arg) {
     audio_http_stream_t *stream = static_cast<audio_http_stream_t*>(arg);
-    esp_http_client_handle_t client = NULL;
-    esp_err_t err;
 
     stream->state = AUDIO_HTTP_STREAM_STATE_CONNECTING;
 
     while (stream->task_running) {
-        if (stream->paused) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
+        ESP_LOGI(TAG, "Creating HTTP client for URL: %s", stream->cfg.url);
 
+        esp_http_client_config_t config = {};
+        config.url = stream->cfg.url;
+        config.event_handler = http_event_handler;
+        config.user_data = stream;            // delivered to http_event_handler
+        config.timeout_ms = stream->cfg.read_timeout_ms;
+        config.keep_alive_enable = false;
+        config.skip_cert_common_name_check = true;
+        config.buffer_size = 1024;            // rx chunk size for HTTP_EVENT_ON_DATA
+
+        esp_http_client_handle_t client = esp_http_client_init(&config);
         if (!client) {
-            ESP_LOGI(TAG, "Creating HTTP client for URL: %s", stream->cfg.url);
-            // Log URL length and first few bytes to check for corruption
-            ESP_LOGI(TAG, "URL length: %d, first bytes: 0x%02X 0x%02X 0x%02X 0x%02X",
-                     strlen(stream->cfg.url),
-                     (unsigned char)stream->cfg.url[0],
-                     (unsigned char)stream->cfg.url[1],
-                     (unsigned char)stream->cfg.url[2],
-                     (unsigned char)stream->cfg.url[3]);
-            esp_http_client_config_t config = {};
-            config.url = stream->cfg.url;
-            config.event_handler = http_event_handler;
-            config.timeout_ms = stream->cfg.read_timeout_ms;
-            config.keep_alive_enable = false;
-            config.skip_cert_common_name_check = true;
-
-            ESP_LOGI(TAG, "Calling esp_http_client_init...");
-            client = esp_http_client_init(&config);
-            if (!client) {
-                ESP_LOGE(TAG, "Failed to initialize HTTP client for URL: %s", stream->cfg.url);
-                stream->state = AUDIO_HTTP_STREAM_STATE_ERROR;
-                stream->error_occurred = true;
-                dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_ERROR);
-
-                if (stream->cfg.enable_auto_reconnect) {
-                    vTaskDelay(pdMS_TO_TICKS(stream->cfg.reconnect_timeout_ms));
-                    continue;
-                }
-                break;
-            }
-
-            ESP_LOGI(TAG, "HTTP client initialized, opening connection...");
-            err = esp_http_client_open(client, 0);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to open HTTP connection: %s, URL: %s", esp_err_to_name(err), stream->cfg.url);
-                esp_http_client_cleanup(client);
-                client = NULL;
-                stream->state = AUDIO_HTTP_STREAM_STATE_ERROR;
-                dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_DISCONNECTED);
-
-                if (stream->cfg.enable_auto_reconnect) {
-                    vTaskDelay(pdMS_TO_TICKS(stream->cfg.reconnect_timeout_ms));
-                    continue;
-                }
-                break;
-            }
-            ESP_LOGI(TAG, "HTTP connection opened successfully");
-
-            stream->state = AUDIO_HTTP_STREAM_STATE_BUFFERING;
-            dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_CONNECTED);
-
-            int content_length = esp_http_client_fetch_headers(client);
-            stream->content_length = content_length;
-            ESP_LOGI(TAG, "Content length: %d", content_length);
-        }
-
-        uint8_t *buf = static_cast<uint8_t*>(malloc(1024));
-        if (!buf) {
-            ESP_LOGE(TAG, "Failed to allocate read buffer");
-            break;
-        }
-
-        int read_len = esp_http_client_read(client, reinterpret_cast<char*>(buf), 1024);
-
-        // Debug: log every read attempt result
-        ESP_LOGD(TAG, "HTTP read result: read_len=%d, total_downloaded=%d", read_len, (int)stream->total_bytes_downloaded);
-
-        if (read_len > 0) {
-            size_t written = 0;
-            while (written < static_cast<size_t>(read_len)) {
-                size_t to_write = read_len - written;
-                BaseType_t res = xRingbufferSend(stream->ringbuf, buf + written, to_write, pdMS_TO_TICKS(100));
-                if (res == pdTRUE) {
-                    written += to_write;
-                } else {
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                }
-            }
-
-            stream->total_bytes_downloaded += read_len;
-
-            UBaseType_t items_waiting = 0;
-            vRingbufferGetInfo(stream->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
-            stream->bytes_available = items_waiting;
-
-            LOGI_2(TAG, "HTTP download: read=%d, total=%d, buffered=%d",
-                    read_len, (int)stream->total_bytes_downloaded, (int)stream->bytes_available);
-
-            if (stream->state == AUDIO_HTTP_STREAM_STATE_BUFFERING &&
-                stream->bytes_available >= stream->cfg.high_watermark) {
-                stream->state = AUDIO_HTTP_STREAM_STATE_PLAYING;
-                dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_BUFFER_READY);
-            }
-        } else if (read_len == 0) {
-            ESP_LOGI(TAG, "End of HTTP stream");
-            stream->eof_reached = true;
-            stream->state = AUDIO_HTTP_STREAM_STATE_FINISHED;
-            dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_FINISHED);
-            break;
-        } else {
-            ESP_LOGE(TAG, "HTTP read error: %d", read_len);
-            esp_http_client_cleanup(client);
-            client = NULL;
+            ESP_LOGE(TAG, "Failed to initialize HTTP client for URL: %s", stream->cfg.url);
             stream->state = AUDIO_HTTP_STREAM_STATE_ERROR;
             stream->error_occurred = true;
             dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_ERROR);
 
-            if (stream->cfg.enable_auto_reconnect) {
+            if (stream->cfg.enable_auto_reconnect && stream->task_running) {
                 vTaskDelay(pdMS_TO_TICKS(stream->cfg.reconnect_timeout_ms));
-                stream->error_occurred = false;
                 continue;
             }
             break;
         }
 
-        free(buf);
+        stream->state = AUDIO_HTTP_STREAM_STATE_BUFFERING;
+        stream->error_occurred = false;
+        dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_CONNECTED);
 
-        if (stream->state == AUDIO_HTTP_STREAM_STATE_PLAYING &&
-            stream->bytes_available < stream->cfg.low_watermark) {
-            stream->state = AUDIO_HTTP_STREAM_STATE_BUFFERING;
-            dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_BUFFERING);
+        // Blocking perform() drives the whole transfer: it parses the response
+        // (handles HTTP/1.0 + no Content-Length continuous streams correctly)
+        // and delivers the body via HTTP_EVENT_ON_DATA until the server closes
+        // the connection or an error/timeout occurs.
+        ESP_LOGI(TAG, "Starting HTTP perform (streaming)...");
+        esp_err_t err = esp_http_client_perform(client);
+
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "HTTP stream ended (server closed connection)");
+        } else {
+            ESP_LOGW(TAG, "HTTP perform error: %s", esp_err_to_name(err));
         }
-    }
 
-    if (client) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
+
+        if (!stream->task_running) {
+            break;
+        }
+
+        if (stream->cfg.enable_auto_reconnect) {
+            ESP_LOGI(TAG, "Reconnecting in %d ms...", stream->cfg.reconnect_timeout_ms);
+            dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_DISCONNECTED);
+            vTaskDelay(pdMS_TO_TICKS(stream->cfg.reconnect_timeout_ms));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "End of HTTP stream");
+        stream->eof_reached = true;
+        stream->state = AUDIO_HTTP_STREAM_STATE_FINISHED;
+        dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_FINISHED);
+        break;
     }
 
     stream->task = NULL;
@@ -534,8 +493,18 @@ esp_err_t audio_http_stream_close(audio_http_stream_handle_t h) {
 
     h->task_running = false;
 
+    /* Wait for the download task to exit on its own — do NOT vTaskDelete it.
+     * The task may be blocked inside esp_http_client_perform()'s lwIP socket
+     * call; killing it there corrupts lwIP/FreeRTOS internal state and trips
+     * an xQueueGenericSend assert. The task clears h->task before deleting
+     * itself, so poll until it's gone (bounded wait covers one read timeout). */
     if (h->task) {
-        vTaskDelete(h->task);
+        const int max_wait = 400;  // up to 8s (400 * 20ms)
+        for (int i = 0; i < max_wait; i++) {
+            TaskHandle_t t = h->task;
+            if (t == NULL || eTaskGetState(t) == eDeleted) break;
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
         h->task = NULL;
     }
 
