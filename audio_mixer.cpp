@@ -85,14 +85,20 @@ static void mixer_task(void *arg) {
             }
         }
 
+        bool has_data = s_active_streams > 0;
+
         audio_mixer_unlock();
 
-        size_t written = 0;
-        if (s_cfg.write_fn) {
-            s_cfg.write_fn(mix, bytes, &written, portMAX_DELAY);
-            if (written != bytes) {
-                ESP_LOGW(TAG, "mixer short write %u/%u", (unsigned)written, (unsigned)bytes);
+        if (has_data) {
+            size_t written = 0;
+            if (s_cfg.write_fn) {
+                s_cfg.write_fn(mix, bytes, &written, portMAX_DELAY);
+                if (written != bytes) {
+                    ESP_LOGW(TAG, "mixer short write %u/%u", (unsigned)written, (unsigned)bytes);
+                }
             }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
 
@@ -495,7 +501,7 @@ audio_stream_handle_t audio_stream_new(audio_stream_config_t *cfg) {
     }
 
     /* always create a ringbuffer */
-    stream->pcm_rb = xRingbufferCreate(16 * 1024, RINGBUF_TYPE_BYTEBUF);
+    stream->pcm_rb = xRingbufferCreate(8 * 1024, RINGBUF_TYPE_BYTEBUF);
 
     if (!stream->pcm_rb || (cfg->type == AUDIO_STREAM_TYPE_DECODER && !stream->file_queue)) {
         if (stream->file_queue) vQueueDelete(stream->file_queue);
@@ -520,10 +526,14 @@ esp_err_t audio_stream_delete(audio_stream_handle_t h) {
     /* remove from stream tracking */
     audio_mixer_remove_stream(s);
 
+    char name_copy[16];
+    strncpy(name_copy, s->name, sizeof(name_copy) - 1);
+    name_copy[sizeof(name_copy) - 1] = '\0';
+
     /* cleanup stream */
     mixer_free_stream_resources(s);
 
-    ESP_LOGI(TAG, "Deleted stream '%s' (active: %u)", s->name, audio_mixer_stream_count());
+    ESP_LOGI(TAG, "Deleted stream '%s' (active: %u)", name_copy, audio_mixer_stream_count());
 
     return ESP_OK;
 }

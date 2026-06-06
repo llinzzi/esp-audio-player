@@ -193,12 +193,13 @@ bool is_mp3_io(audio_stream_io_handle_t io) {
                   (magic[1] == 0x44) &&
                   (magic[2] == 0x33)) /* 'ID3' */
         {
-            audio_stream_io_seek(io, 0, AUDIO_STREAM_SEEK_SET);
-
-            /* Get ID3 head */
+            /* Already have the first 3 bytes ("ID3"). HTTP streams don't support
+             * seek, so don't try to rewind — just read the remaining 7 bytes of
+             * the ID3v2 header in-place to verify it's a valid tag. */
             mp3_id3_header_v2_t tag;
-            if (sizeof(mp3_id3_header_v2_t) == audio_stream_io_read(io, &tag, sizeof(mp3_id3_header_v2_t))) {
-                if (memcmp("ID3", (const void *) &tag, sizeof(tag.header)) == 0) {
+            memcpy(&tag, magic, 3);
+            if (sizeof(tag) - 3 == audio_stream_io_read(io, (uint8_t*)&tag + 3, sizeof(tag) - 3)) {
+                if (memcmp("ID3", (const void *) &tag, 3) == 0) {
                     is_mp3_file = true;
                 }
             }
@@ -234,7 +235,11 @@ DECODE_STATUS decode_mp3_io(HMP3Decoder mp3_decoder, audio_stream_io_handle_t io
         pInstance->bytes_in_data_buf = unread_bytes + nRead;
         pInstance->read_ptr = pInstance->data_buf;
 
-        if ((nRead == 0) || audio_stream_io_eof(io)) {
+        /* Only treat this as end-of-stream when the stream itself reports EOF.
+         * A transient nRead==0 just means the ring buffer was momentarily empty
+         * (network underrun) — NOT the end of the track. Setting eof here caused
+         * the decoder to finish a multi-minute song after ~1s of buffering. */
+        if (audio_stream_io_eof(io)) {
             pInstance->eof_reached = true;
         }
 
@@ -248,8 +253,13 @@ DECODE_STATUS decode_mp3_io(HMP3Decoder mp3_decoder, audio_stream_io_handle_t io
     LOGI_3("data_buf 0x%p, read 0x%p", pInstance->data_buf, pInstance->read_ptr);
 
     if(unread_bytes == 0) {
-        LOGI_1("unread_bytes == 0, status done");
-        return DECODE_STATUS_DONE;
+        if (pInstance->eof_reached) {
+            LOGI_1("unread_bytes == 0 + eof, status done");
+            return DECODE_STATUS_DONE;
+        }
+        /* No data yet but stream is still alive — keep waiting, don't end. */
+        LOGI_1("unread_bytes == 0, no data yet, continue");
+        return DECODE_STATUS_NO_DATA_CONTINUE;
     }
 
     /* Find MP3 sync word from read buffer */
