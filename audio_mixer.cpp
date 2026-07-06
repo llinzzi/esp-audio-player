@@ -95,6 +95,11 @@ static void mixer_task(void *arg) {
                 s_cfg.write_fn(mix, bytes, &written, portMAX_DELAY);
                 if (written != bytes) {
                     ESP_LOGW(TAG, "mixer short write %u/%u", (unsigned)written, (unsigned)bytes);
+                    /* Yield to avoid starving IDLE when I2S is stuck (e.g.
+                     * after decoder stall / force-advance). Without this,
+                     * the mixer task (prio 5) spins here forever and
+                     * triggers the task watchdog. */
+                    vTaskDelay(pdMS_TO_TICKS(2));
                 }
             }
         } else {
