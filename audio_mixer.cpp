@@ -60,6 +60,8 @@ static void mixer_task(void *arg) {
     int16_t *mix = static_cast<int16_t *>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
     ESP_ERROR_CHECK(mix == NULL);
 
+    int consecutive_failures = 0;
+
     while (s_running) {
         memset(mix, 0, bytes);
 
@@ -100,9 +102,22 @@ static void mixer_task(void *arg) {
                      * the mixer task (prio 5) spins here forever and
                      * triggers the task watchdog. */
                     vTaskDelay(pdMS_TO_TICKS(2));
+
+                    /* After too many consecutive failures, the I2S
+                     * peripheral is unrecoverable. Stop the mixer so
+                     * the application can notice and restart audio. */
+                    consecutive_failures++;
+                    if (consecutive_failures > 100) {
+                        ESP_LOGE(TAG, "I2S stuck after %d retries, stopping mixer", consecutive_failures);
+                        s_running = false;
+                        break;
+                    }
+                } else {
+                    consecutive_failures = 0;
                 }
             }
         } else {
+            consecutive_failures = 0;
             vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
