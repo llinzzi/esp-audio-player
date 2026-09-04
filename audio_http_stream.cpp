@@ -48,6 +48,15 @@ typedef struct audio_http_stream {
 
 /* ================= Stream I/O callbacks for HTTP stream ================= */
 
+static size_t http_stream_buffered_bytes(audio_http_stream_t *stream) {
+    if (!stream || !stream->ringbuf) return 0;
+
+    UBaseType_t items_waiting = 0;
+    vRingbufferGetInfo(stream->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
+    stream->bytes_available = items_waiting;
+    return (size_t)items_waiting;
+}
+
 static size_t http_stream_read(void *ctx, void *buf, size_t size) {
     audio_http_stream_t *stream = static_cast<audio_http_stream_t*>(ctx);
     if (!stream || !stream->ringbuf) return 0;
@@ -61,14 +70,15 @@ static size_t http_stream_read(void *ctx, void *buf, size_t size) {
     const int max_retries = 10;
 
     while (total_read < size && retry_count < max_retries) {
-        // If EOF or error, don't wait for more data
-        if (stream->eof_reached || stream->error_occurred) {
+        // An error cannot produce more data. EOF is different: bytes already
+        // queued in the ring buffer must still be drained by the decoder.
+        if (stream->error_occurred) {
             break;
         }
 
         size_t item_size = 0;
         void *item = xRingbufferReceiveUpTo(stream->ringbuf, &item_size,
-                                              pdMS_TO_TICKS(200),
+                                              stream->eof_reached ? 0 : pdMS_TO_TICKS(200),
                                               size - total_read);
 
         if (item && item_size > 0) {
@@ -79,6 +89,7 @@ static size_t http_stream_read(void *ctx, void *buf, size_t size) {
         } else if (item) {
             vRingbufferReturnItem(stream->ringbuf, item);
         } else {
+            if (stream->eof_reached) break;
             // Ringbuffer empty - increment retry count and yield to allow download task to fill buffer
             retry_count++;
             if (retry_count < max_retries) {
@@ -92,6 +103,8 @@ static size_t http_stream_read(void *ctx, void *buf, size_t size) {
         ESP_LOGW(TAG, "http_stream_read: gave up after %d retries, returning 0", max_retries);
     }
 
+    http_stream_buffered_bytes(stream);
+
     return total_read;
 }
 
@@ -104,13 +117,14 @@ static int http_stream_seek(void *ctx, long offset, int whence) {
 static long http_stream_tell(void *ctx) {
     audio_http_stream_t *stream = static_cast<audio_http_stream_t*>(ctx);
     if (!stream) return -1;
-    return static_cast<long>(stream->total_bytes_downloaded - stream->bytes_available);
+    size_t buffered = http_stream_buffered_bytes(stream);
+    return static_cast<long>(stream->total_bytes_downloaded - buffered);
 }
 
 static int http_stream_eof(void *ctx) {
     audio_http_stream_t *stream = static_cast<audio_http_stream_t*>(ctx);
     if (!stream) return 1;
-    return stream->eof_reached && stream->bytes_available == 0;
+    return stream->eof_reached && http_stream_buffered_bytes(stream) == 0;
 }
 
 static void http_stream_close(void *ctx) {
@@ -471,13 +485,7 @@ audio_http_stream_state_t audio_http_stream_get_state(audio_http_stream_handle_t
 }
 
 size_t audio_http_stream_get_buffered_bytes(audio_http_stream_handle_t h) {
-    if (!h) return 0;
-
-    UBaseType_t items_waiting = 0;
-    if (h->ringbuf) {
-        vRingbufferGetInfo(h->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
-    }
-    return items_waiting;
+    return http_stream_buffered_bytes(h);
 }
 
 size_t audio_http_stream_get_total_bytes(audio_http_stream_handle_t h) {

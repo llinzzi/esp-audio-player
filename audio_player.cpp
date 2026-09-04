@@ -548,6 +548,10 @@ static esp_err_t aplay_io(audio_instance_t *i, audio_stream_io_handle_t io) {
         } else if(decode_status == DECODE_STATUS_NO_DATA_CONTINUE)
         {
             LOGI_2("no data");
+            /* Network streams can temporarily have no bytes, and EOF becomes
+             * observable only after their final buffered bytes are drained.
+             * Never spin at decoder priority while waiting for either state. */
+            vTaskDelay(pdMS_TO_TICKS(1));
         } else {
             LOGI_1("breaking out of playback");
             break;
