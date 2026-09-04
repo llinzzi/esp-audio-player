@@ -35,6 +35,7 @@ typedef struct audio_stream {
     QueueHandle_t file_queue;
     RingbufHandle_t pcm_rb;
     audio_player_state_t state;  // used only for RAW stream types.
+    bool pcm_started;
 
     SLIST_ENTRY(audio_stream) next;
 } audio_stream_t;
@@ -68,6 +69,7 @@ static void mixer_task(void *arg) {
 
     while (s_running) {
         memset(mix, 0, bytes);
+        bool has_data = false;
 
         audio_mixer_lock();
 
@@ -79,6 +81,7 @@ static void mixer_task(void *arg) {
             void *item = xRingbufferReceiveUpTo(stream->pcm_rb, &received_bytes, pdMS_TO_TICKS(5), bytes);
 
             if (item && received_bytes > 0) {
+                has_data = true;
                 int16_t *samples = static_cast<int16_t *>(item);
                 size_t count = received_bytes / sizeof(int16_t);
 
@@ -90,8 +93,6 @@ static void mixer_task(void *arg) {
                 vRingbufferReturnItem(stream->pcm_rb, item);
             }
         }
-
-        bool has_data = s_active_streams > 0;
 
         audio_mixer_unlock();
 
@@ -123,6 +124,11 @@ static void mixer_task(void *arg) {
                 }
             }
         } else {
+            /* Do not continuously feed silence merely because a stream object
+             * exists.  Before the decoder has produced its first PCM frame it
+             * may need the output mutex to apply the real sample rate; writing
+             * silence here can otherwise starve that lower-priority task and
+             * leave the UI showing a track that never becomes audible. */
             consecutive_failures = 0;
             vTaskDelay(pdMS_TO_TICKS(20));
         }
@@ -143,6 +149,11 @@ IRAM_ATTR static esp_err_t mixer_stream_write(void *data, size_t size, size_t *b
     BaseType_t res = xRingbufferSend(s->pcm_rb, data, size, timeout);
     if (res == pdTRUE) {
         if (bytes_written) *bytes_written = size;
+        if (!s->pcm_started && size > 0) {
+            s->pcm_started = true;
+            ESP_LOGI(TAG, "stream '%s' PCM output started (%u bytes)",
+                     s->name, (unsigned)size);
+        }
     } else {
         if (bytes_written) *bytes_written = 0;
         ESP_LOGW(TAG, "stream ringbuf full");
