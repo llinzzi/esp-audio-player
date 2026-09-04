@@ -44,6 +44,10 @@ static audio_stream_list s_stream_list = SLIST_HEAD_INITIALIZER(s_stream_list);
 static uint32_t s_stream_name_counter = 0;  // counter for unique naming (monotonic)
 static uint32_t s_active_streams = 0;       // counter for stream counting
 static SemaphoreHandle_t s_stream_mutex = NULL;
+/* Serializes I2S writes with clock changes requested by a decoder.  MP3 files
+ * do not expose their real sample rate until the first frame is decoded, so
+ * reconfiguration necessarily happens after the mixer task has started. */
+static SemaphoreHandle_t s_output_mutex = NULL;
 
 
 static int16_t sat_add16(int32_t a, int32_t b) {
@@ -94,7 +98,9 @@ static void mixer_task(void *arg) {
         if (has_data) {
             size_t written = 0;
             if (s_cfg.write_fn) {
+                if (s_output_mutex) xSemaphoreTake(s_output_mutex, portMAX_DELAY);
                 s_cfg.write_fn(mix, bytes, &written, portMAX_DELAY);
+                if (s_output_mutex) xSemaphoreGive(s_output_mutex);
                 if (written != bytes) {
                     ESP_LOGW(TAG, "mixer short write %u/%u", (unsigned)written, (unsigned)bytes);
                     /* Yield to avoid starving IDLE when I2S is stuck (e.g.
@@ -145,11 +151,6 @@ IRAM_ATTR static esp_err_t mixer_stream_write(void *data, size_t size, size_t *b
 }
 
 static esp_err_t mixer_stream_clk_set_fn(uint32_t rate, uint32_t bits_cfg, i2s_slot_mode_t ch) {
-    if (rate != s_cfg.i2s_format.sample_rate) {
-        ESP_LOGE(TAG, "stream sample rate mismatch: %lu Hz (mixer expects %u Hz)", rate, s_cfg.i2s_format.sample_rate);
-        return ESP_ERR_INVALID_ARG;
-    }
-
     if (bits_cfg != s_cfg.i2s_format.bits_per_sample) {
         ESP_LOGE(TAG, "stream bit depth mismatch: %lu bits (mixer expects %lu bits)", bits_cfg, s_cfg.i2s_format.bits_per_sample);
         return ESP_ERR_INVALID_ARG;
@@ -158,6 +159,32 @@ static esp_err_t mixer_stream_clk_set_fn(uint32_t rate, uint32_t bits_cfg, i2s_s
     if (ch != s_cfg.i2s_format.channels) {
         ESP_LOGE(TAG, "stream channels mismatch: %u (mixer expects %lu)", ch, s_cfg.i2s_format.channels);
         return ESP_ERR_INVALID_ARG;
+    }
+
+    if (rate != s_cfg.i2s_format.sample_rate) {
+        /* A decoder learns the MP3 sample rate from its first frame.  With one
+         * stream, follow that rate instead of killing playback merely because
+         * the mixer's bootstrap value was 44.1 kHz.  Different-rate streams
+         * still cannot be mixed without resampling, so retain the guard for
+         * that case. */
+        audio_mixer_lock();
+        uint32_t active_streams = s_active_streams;
+        audio_mixer_unlock();
+        if (active_streams > 1) {
+            ESP_LOGE(TAG, "cannot change output to %lu Hz with %lu active streams",
+                     rate, active_streams);
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        if (s_output_mutex) xSemaphoreTake(s_output_mutex, portMAX_DELAY);
+        esp_err_t err = s_cfg.clk_set_fn(rate, bits_cfg, ch);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "output sample rate %u -> %lu Hz",
+                     s_cfg.i2s_format.sample_rate, rate);
+            s_cfg.i2s_format.sample_rate = rate;
+        }
+        if (s_output_mutex) xSemaphoreGive(s_output_mutex);
+        return err;
     }
 
     return ESP_OK;
@@ -246,13 +273,21 @@ esp_err_t audio_mixer_init(audio_mixer_config_t *cfg) {
     i2s_slot_mode_t channel_setting = (s_cfg.i2s_format.channels == 1) ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO;
     ESP_RETURN_ON_ERROR(s_cfg.clk_set_fn(s_cfg.i2s_format.sample_rate, s_cfg.i2s_format.bits_per_sample, channel_setting), TAG, "clk set failed");
 
-    s_running = true;
     if (!s_stream_mutex) s_stream_mutex = xSemaphoreCreateMutex();
+    if (!s_output_mutex) s_output_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_stream_mutex && s_output_mutex, ESP_ERR_NO_MEM,
+                        TAG, "failed to create mixer mutexes");
 
     SLIST_INIT(&s_stream_list);
 
+    s_running = true;
     BaseType_t ok = xTaskCreatePinnedToCore(mixer_task, "audio_mixer", 4096, NULL, s_cfg.priority, &s_mixer_task, s_cfg.coreID);
-    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_FAIL, TAG, "failed to start mixer");
+    if (ok != pdPASS) {
+        s_running = false;
+        s_mixer_task = NULL;
+        ESP_LOGE(TAG, "failed to start mixer");
+        return ESP_FAIL;
+    }
 
     ESP_LOGD(TAG, "mixer started");
     return ESP_OK;
