@@ -34,18 +34,11 @@ typedef struct audio_http_stream {
     bool paused;
     bool eof_reached;
     bool error_occurred;
-    bool id3_tag_skipped;
 
     size_t total_bytes_downloaded;
     size_t bytes_available;
 
     audio_stream_io_handle_t io_handle;
-
-    // Seek support: keep initial bytes to allow rewinding
-    uint8_t *initial_buf;
-    size_t initial_buf_size;
-    size_t initial_buf_read_pos;
-    size_t initial_buf_filled;
 } audio_http_stream_t;
 
 /* ================= Stream I/O callbacks for HTTP stream ================= */
@@ -57,77 +50,36 @@ static size_t http_stream_read(void *ctx, void *buf, size_t size) {
     size_t total_read = 0;
     uint8_t *dst = static_cast<uint8_t*>(buf);
 
-    // Note: ID3v2 tag skipping disabled - files with ID3 tags may not play correctly
-
-    // First, read from initial buffer if there's any data (for seek support)
-    while (total_read < size && stream->initial_buf_read_pos < stream->initial_buf_filled) {
-        size_t to_copy = size - total_read;
-        size_t from_buf = stream->initial_buf_filled - stream->initial_buf_read_pos;
-        if (to_copy > from_buf) {
-            to_copy = from_buf;
-        }
-        memcpy(dst + total_read, stream->initial_buf + stream->initial_buf_read_pos, to_copy);
-        total_read += to_copy;
-        stream->initial_buf_read_pos += to_copy;
-    }
-
-    // If initial buffer is exhausted or not used, read from ring buffer
-    // Retry a few times if ringbuffer is temporarily empty to avoid premature EOF
-    int retry_count = 0;
-    const int max_retries = 10;
-
-    while (total_read < size && retry_count < max_retries) {
-        // If EOF or error, don't wait for more data
-        if (stream->eof_reached || stream->error_occurred) {
-            break;
-        }
-
+    while (total_read < size) {
         size_t item_size = 0;
         void *item = xRingbufferReceiveUpTo(stream->ringbuf, &item_size,
-                                              pdMS_TO_TICKS(200),
+                                              pdMS_TO_TICKS(100),
                                               size - total_read);
 
         if (item && item_size > 0) {
             memcpy(dst + total_read, item, item_size);
-
             total_read += item_size;
             vRingbufferReturnItem(stream->ringbuf, item);
-
-            // Keep a copy of initial bytes for seek support
-            if (stream->initial_buf && stream->initial_buf_filled < stream->initial_buf_size) {
-                size_t to_save = item_size;
-                if (stream->initial_buf_filled + to_save > stream->initial_buf_size) {
-                    to_save = stream->initial_buf_size - stream->initial_buf_filled;
-                }
-                if (to_save > 0) {
-                    memcpy(stream->initial_buf + stream->initial_buf_filled, item, to_save);
-                    stream->initial_buf_filled += to_save;
-                }
-            }
-            retry_count = 0;  // Reset retry count on successful read
+        } else if (item) {
+            vRingbufferReturnItem(stream->ringbuf, item);
         } else {
-            if (item) {
-                vRingbufferReturnItem(stream->ringbuf, item);
+            if (stream->eof_reached) {
+                break;
             }
-            // Ringbuffer empty - increment retry count and yield to allow download task to fill buffer
-            retry_count++;
-            if (retry_count < max_retries) {
-                ESP_LOGD(TAG, "ringbuf empty, retry %d/%d", retry_count, max_retries);
-                vTaskDelay(pdMS_TO_TICKS(50));
+            if (stream->error_occurred) {
+                break;
             }
         }
-    }
-
-    if (retry_count >= max_retries && total_read == 0) {
-        ESP_LOGW(TAG, "http_stream_read: gave up after %d retries, returning 0", max_retries);
     }
 
     return total_read;
 }
 
 static int http_stream_seek(void *ctx, long offset, int whence) {
-    // Seek not supported for HTTP stream
-    // Just return error to indicate seek is not possible
+    (void)ctx;
+    (void)offset;
+    (void)whence;
+    ESP_LOGW(TAG, "seek not supported on HTTP streams");
     return -1;
 }
 
@@ -190,9 +142,6 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
         case HTTP_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
             break;
-        case HTTP_EVENT_REDIRECT:
-            ESP_LOGI(TAG, "HTTP_EVENT_REDIRECT");
-            break;
     }
     return ESP_OK;
 }
@@ -211,25 +160,15 @@ static void http_download_task(void *arg) {
         }
 
         if (!client) {
-            ESP_LOGI(TAG, "Creating HTTP client for URL: %s", stream->cfg.url);
-            // Log URL length and first few bytes to check for corruption
-            ESP_LOGI(TAG, "URL length: %d, first bytes: 0x%02X 0x%02X 0x%02X 0x%02X",
-                     strlen(stream->cfg.url),
-                     (unsigned char)stream->cfg.url[0],
-                     (unsigned char)stream->cfg.url[1],
-                     (unsigned char)stream->cfg.url[2],
-                     (unsigned char)stream->cfg.url[3]);
             esp_http_client_config_t config = {};
             config.url = stream->cfg.url;
             config.event_handler = http_event_handler;
             config.timeout_ms = stream->cfg.read_timeout_ms;
-            config.keep_alive_enable = false;
-            config.skip_cert_common_name_check = true;
+            config.keep_alive_enable = true;
 
-            ESP_LOGI(TAG, "Calling esp_http_client_init...");
             client = esp_http_client_init(&config);
             if (!client) {
-                ESP_LOGE(TAG, "Failed to initialize HTTP client for URL: %s", stream->cfg.url);
+                ESP_LOGE(TAG, "Failed to initialize HTTP client");
                 stream->state = AUDIO_HTTP_STREAM_STATE_ERROR;
                 stream->error_occurred = true;
                 dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_ERROR);
@@ -241,10 +180,9 @@ static void http_download_task(void *arg) {
                 break;
             }
 
-            ESP_LOGI(TAG, "HTTP client initialized, opening connection...");
             err = esp_http_client_open(client, 0);
             if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to open HTTP connection: %s, URL: %s", esp_err_to_name(err), stream->cfg.url);
+                ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
                 esp_http_client_cleanup(client);
                 client = NULL;
                 stream->state = AUDIO_HTTP_STREAM_STATE_ERROR;
@@ -256,7 +194,6 @@ static void http_download_task(void *arg) {
                 }
                 break;
             }
-            ESP_LOGI(TAG, "HTTP connection opened successfully");
 
             stream->state = AUDIO_HTTP_STREAM_STATE_BUFFERING;
             dispatch_event(stream, AUDIO_HTTP_STREAM_EVENT_CONNECTED);
@@ -272,9 +209,6 @@ static void http_download_task(void *arg) {
         }
 
         int read_len = esp_http_client_read(client, reinterpret_cast<char*>(buf), 1024);
-
-        // Debug: log every read attempt result
-        ESP_LOGD(TAG, "HTTP read result: read_len=%d, total_downloaded=%d", read_len, (int)stream->total_bytes_downloaded);
 
         if (read_len > 0) {
             size_t written = 0;
@@ -293,9 +227,6 @@ static void http_download_task(void *arg) {
             UBaseType_t items_waiting = 0;
             vRingbufferGetInfo(stream->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
             stream->bytes_available = items_waiting;
-
-            ESP_LOGI(TAG, "HTTP download: read=%d, total=%d, buffered=%d",
-                    read_len, (int)stream->total_bytes_downloaded, (int)stream->bytes_available);
 
             if (stream->state == AUDIO_HTTP_STREAM_STATE_BUFFERING &&
                 stream->bytes_available >= stream->cfg.high_watermark) {
@@ -365,16 +296,7 @@ audio_http_stream_handle_t audio_http_stream_open(const audio_http_stream_config
     audio_http_stream_t *stream = static_cast<audio_http_stream_t*>(calloc(1, sizeof(audio_http_stream_t)));
     ESP_RETURN_ON_FALSE(stream != NULL, NULL, TAG, "allocation failed");
 
-    // Copy the URL string since caller may free it
-    char *url_copy = strdup(cfg->url);
-    if (!url_copy) {
-        ESP_LOGE(TAG, "Failed to copy URL string");
-        free(stream);
-        return NULL;
-    }
-
     stream->cfg = *cfg;
-    stream->cfg.url = url_copy;
 
     if (stream->cfg.buffer_size == 0) {
         stream->cfg.buffer_size = 32 * 1024;
@@ -398,7 +320,6 @@ audio_http_stream_handle_t audio_http_stream_open(const audio_http_stream_config
     stream->ringbuf = xRingbufferCreate(stream->cfg.buffer_size, RINGBUF_TYPE_BYTEBUF);
     if (!stream->ringbuf) {
         ESP_LOGE(TAG, "Failed to create ring buffer");
-        free(url_copy);
         free(stream);
         return NULL;
     }
@@ -407,7 +328,6 @@ audio_http_stream_handle_t audio_http_stream_open(const audio_http_stream_config
     if (!stream->mutex) {
         ESP_LOGE(TAG, "Failed to create mutex");
         vRingbufferDelete(stream->ringbuf);
-        free(url_copy);
         free(stream);
         return NULL;
     }
@@ -420,20 +340,9 @@ audio_http_stream_handle_t audio_http_stream_open(const audio_http_stream_config
         ESP_LOGE(TAG, "Failed to create stream I/O");
         vSemaphoreDelete(stream->mutex);
         vRingbufferDelete(stream->ringbuf);
-        free(url_copy);
         free(stream);
         return NULL;
     }
-
-    // Allocate initial buffer for seek support (8KB to cover MP3 headers)
-    stream->initial_buf_size = 8 * 1024;
-    stream->initial_buf = static_cast<uint8_t*>(malloc(stream->initial_buf_size));
-    if (!stream->initial_buf) {
-        ESP_LOGW(TAG, "Failed to allocate initial buffer, seek will not be supported");
-        stream->initial_buf_size = 0;
-    }
-    stream->initial_buf_read_pos = 0;
-    stream->initial_buf_filled = 0;
 
     BaseType_t res = xTaskCreatePinnedToCore(
         http_download_task,
@@ -450,7 +359,6 @@ audio_http_stream_handle_t audio_http_stream_open(const audio_http_stream_config
         audio_stream_io_close(stream->io_handle);
         vSemaphoreDelete(stream->mutex);
         vRingbufferDelete(stream->ringbuf);
-        free(url_copy);
         free(stream);
         return NULL;
     }
@@ -528,33 +436,19 @@ esp_err_t audio_http_stream_close(audio_http_stream_handle_t h) {
     h->task_running = false;
 
     if (h->task) {
-        vTaskDelete(h->task);
-        h->task = NULL;
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     if (h->io_handle) {
-        // Don't close io_handle here - it's owned and closed by the audio player
-        h->io_handle = NULL;
+        audio_stream_io_close(h->io_handle);
     }
 
     if (h->ringbuf) {
         vRingbufferDelete(h->ringbuf);
-        h->ringbuf = NULL;
     }
 
     if (h->mutex) {
         vSemaphoreDelete(h->mutex);
-        h->mutex = NULL;
-    }
-
-    if (h->initial_buf) {
-        free(h->initial_buf);
-        h->initial_buf = NULL;
-    }
-
-    if (h->cfg.url) {
-        free((void*)h->cfg.url);
-        h->cfg.url = NULL;
     }
 
     free(h);
